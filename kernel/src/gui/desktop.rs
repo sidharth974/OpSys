@@ -21,15 +21,24 @@ fn execute_terminal_cmd(cmd: &str) -> Vec<Option<(String, u32)>> {
                 ("help", "Show this help"),
                 ("uname", "System information"),
                 ("mem", "Memory usage"),
-                ("lspci", "List PCI devices"),
                 ("ps", "List threads"),
+                ("ls <path>", "List directory"),
+                ("cat <file>", "Read file contents"),
+                ("mkdir <path>", "Create directory"),
+                ("touch <path>", "Create empty file"),
+                ("write <f> <d>", "Write data to file"),
+                ("rm <path>", "Remove file"),
+                ("df", "Filesystem usage"),
+                ("lspci", "List PCI devices"),
+                ("ifconfig", "Network interfaces"),
+                ("readelf <path>", "Parse ELF binary"),
                 ("ai", "Run AI inference"),
-                ("uptime", "System uptime"),
-                ("clear", "Clear terminal"),
-                ("echo <text>", "Print text"),
                 ("security", "Security status"),
                 ("bench <N>", "Matrix benchmark"),
                 ("neofetch", "System summary"),
+                ("uptime", "Uptime"),
+                ("echo <text>", "Print text"),
+                ("clear", "Clear terminal"),
             ] {
                 out.push(Some((format!("  {:<14} {}", cmd, desc), colors::TEXT_DIM)));
             }
@@ -119,8 +128,211 @@ fn execute_terminal_cmd(cmd: &str) -> Vec<Option<(String, u32)>> {
             out.push(Some((format!("                      AI: Tensor engine active"), colors::TEXT_DIM)));
             out.push(Some((format!("                      Security: W^X + NX + Caps"), colors::TEXT_DIM)));
         }
+        "ls" => {
+            let path = parts.get(1).copied().unwrap_or("/");
+            let vfs = crate::fs::vfs::VFS.lock();
+            match vfs.resolve_path(path) {
+                Some(id) => {
+                    if let Some(entries) = vfs.list_dir(id) {
+                        for (name, itype, size) in entries {
+                            let type_str = match itype {
+                                crate::fs::vfs::InodeType::Directory => "d",
+                                crate::fs::vfs::InodeType::File => "-",
+                                crate::fs::vfs::InodeType::Device => "c",
+                            };
+                            let color = match itype {
+                                crate::fs::vfs::InodeType::Directory => colors::TEXT_CYAN,
+                                crate::fs::vfs::InodeType::File => colors::TEXT_WHITE,
+                                crate::fs::vfs::InodeType::Device => colors::TEXT_YELLOW,
+                            };
+                            out.push(Some((format!("{} {:>6}  {}", type_str, size, name), color)));
+                        }
+                    } else {
+                        out.push(Some((format!("not a directory: {}", path), colors::TEXT_RED)));
+                    }
+                }
+                None => out.push(Some((format!("no such path: {}", path), colors::TEXT_RED))),
+            }
+        }
+        "cat" => {
+            let path = match parts.get(1) {
+                Some(p) => *p,
+                None => { out.push(Some((String::from("usage: cat <path>"), colors::TEXT_RED))); parts[0] }
+            };
+            if parts.len() > 1 {
+                let vfs = crate::fs::vfs::VFS.lock();
+                match vfs.resolve_path(path) {
+                    Some(id) => {
+                        if let Some(data) = vfs.read_file(id) {
+                            if let Ok(text) = core::str::from_utf8(data) {
+                                for line in text.lines() {
+                                    out.push(Some((String::from(line), colors::TEXT_WHITE)));
+                                }
+                            } else {
+                                out.push(Some((format!("binary file ({} bytes)", data.len()), colors::TEXT_DIM)));
+                            }
+                        } else {
+                            out.push(Some((format!("not a file: {}", path), colors::TEXT_RED)));
+                        }
+                    }
+                    None => out.push(Some((format!("no such file: {}", path), colors::TEXT_RED))),
+                }
+            }
+        }
+        "mkdir" => {
+            if let Some(&path) = parts.get(1) {
+                let mut vfs = crate::fs::vfs::VFS.lock();
+                // Split into parent path and new dir name
+                let (parent_path, dir_name) = match path.rfind('/') {
+                    Some(pos) if pos > 0 => (&path[..pos], &path[pos+1..]),
+                    _ => ("/", path.trim_start_matches('/')),
+                };
+                match vfs.resolve_path(parent_path) {
+                    Some(parent_id) => {
+                        vfs.mkdir(parent_id, dir_name);
+                        out.push(Some((format!("created: {}", path), colors::TEXT_GREEN)));
+                    }
+                    None => out.push(Some((format!("parent not found: {}", parent_path), colors::TEXT_RED))),
+                }
+            } else {
+                out.push(Some((String::from("usage: mkdir <path>"), colors::TEXT_RED)));
+            }
+        }
+        "touch" => {
+            if let Some(&path) = parts.get(1) {
+                let mut vfs = crate::fs::vfs::VFS.lock();
+                let (parent_path, file_name) = match path.rfind('/') {
+                    Some(pos) if pos > 0 => (&path[..pos], &path[pos+1..]),
+                    _ => ("/tmp", path.trim_start_matches('/')),
+                };
+                match vfs.resolve_path(parent_path) {
+                    Some(parent_id) => {
+                        vfs.create_file(parent_id, file_name, b"");
+                        out.push(Some((format!("created: {}", path), colors::TEXT_GREEN)));
+                    }
+                    None => out.push(Some((format!("parent not found: {}", parent_path), colors::TEXT_RED))),
+                }
+            } else {
+                out.push(Some((String::from("usage: touch <path>"), colors::TEXT_RED)));
+            }
+        }
+        "write" => {
+            if parts.len() >= 3 {
+                let path = parts[1];
+                let data = parts[2..].join(" ");
+                let mut vfs = crate::fs::vfs::VFS.lock();
+                match vfs.resolve_path(path) {
+                    Some(id) => {
+                        if vfs.write_file(id, data.as_bytes()) {
+                            out.push(Some((format!("wrote {} bytes to {}", data.len(), path), colors::TEXT_GREEN)));
+                        } else {
+                            out.push(Some((String::from("write failed"), colors::TEXT_RED)));
+                        }
+                    }
+                    None => out.push(Some((format!("no such file: {}", path), colors::TEXT_RED))),
+                }
+            } else {
+                out.push(Some((String::from("usage: write <file> <data>"), colors::TEXT_RED)));
+            }
+        }
+        "rm" => {
+            if let Some(&path) = parts.get(1) {
+                let mut vfs = crate::fs::vfs::VFS.lock();
+                if vfs.remove(path) {
+                    out.push(Some((format!("removed: {}", path), colors::TEXT_GREEN)));
+                } else {
+                    out.push(Some((format!("cannot remove: {}", path), colors::TEXT_RED)));
+                }
+            } else {
+                out.push(Some((String::from("usage: rm <path>"), colors::TEXT_RED)));
+            }
+        }
+        "df" => {
+            let vfs = crate::fs::vfs::VFS.lock();
+            let (files, dirs, bytes) = vfs.stats();
+            out.push(Some((String::from("Filesystem     Files  Dirs   Used"), colors::TEXT_CYAN)));
+            out.push(Some((format!("tmpfs          {:>5}  {:>4}   {} B", files, dirs, bytes), colors::TEXT_WHITE)));
+        }
+        "ifconfig" | "ip" => {
+            let ifaces = crate::net::interface::INTERFACES.lock();
+            if ifaces.is_empty() {
+                out.push(Some((String::from("No network interfaces"), colors::TEXT_DIM)));
+            } else {
+                for iface in ifaces.iter() {
+                    out.push(Some((format!("{}: {} ({})",
+                        iface.name,
+                        if iface.link_up { "UP" } else { "DOWN" },
+                        iface.mac_str()), colors::TEXT_CYAN)));
+                    out.push(Some((format!("  inet {}  mask {}.{}.{}.{}",
+                        iface.ip_str(),
+                        iface.netmask[0], iface.netmask[1], iface.netmask[2], iface.netmask[3]),
+                        colors::TEXT_WHITE)));
+                    out.push(Some((format!("  gateway {}.{}.{}.{}",
+                        iface.gateway[0], iface.gateway[1], iface.gateway[2], iface.gateway[3]),
+                        colors::TEXT_DIM)));
+                    out.push(Some((format!("  PCI {:04x}:{:04x}  RX:{} TX:{}",
+                        iface.vendor_id, iface.device_id,
+                        iface.rx_packets, iface.tx_packets), colors::TEXT_DIM)));
+                }
+            }
+        }
+        "readelf" => {
+            if let Some(&path) = parts.get(1) {
+                let vfs = crate::fs::vfs::VFS.lock();
+                match vfs.resolve_path(path) {
+                    Some(id) => {
+                        if let Some(data) = vfs.read_file(id) {
+                            match crate::loader::elf::parse(data) {
+                                Ok(info) => {
+                                    out.push(Some((format!("ELF {} {}", info.machine, info.elf_type), colors::TEXT_CYAN)));
+                                    out.push(Some((format!("Entry: {:#x}", info.entry_point), colors::TEXT_WHITE)));
+                                    out.push(Some((format!("Segments: {} LOAD, {} bytes total",
+                                        info.segments.len(), info.total_mem), colors::TEXT_WHITE)));
+                                    for seg in &info.segments {
+                                        out.push(Some((format!("  {:#010x} {} {} bytes",
+                                            seg.vaddr, seg.flags_str, seg.memsz), colors::TEXT_DIM)));
+                                    }
+                                    match crate::loader::elf::validate(&info) {
+                                        Ok(()) => out.push(Some((String::from("Validation: PASS"), colors::TEXT_GREEN))),
+                                        Err(e) => out.push(Some((format!("Validation: FAIL - {}", e), colors::TEXT_RED))),
+                                    }
+                                }
+                                Err(e) => out.push(Some((format!("ELF error: {}", e), colors::TEXT_RED))),
+                            }
+                        } else {
+                            out.push(Some((String::from("not a file"), colors::TEXT_RED)));
+                        }
+                    }
+                    None => out.push(Some((format!("no such file: {}", path), colors::TEXT_RED))),
+                }
+            } else {
+                out.push(Some((String::from("usage: readelf <path>"), colors::TEXT_RED)));
+            }
+        }
+        "hostname" => {
+            let vfs = crate::fs::vfs::VFS.lock();
+            if let Some(id) = vfs.resolve_path("/etc/hostname") {
+                if let Some(data) = vfs.read_file(id) {
+                    if let Ok(name) = core::str::from_utf8(data) {
+                        out.push(Some((String::from(name.trim()), colors::TEXT_WHITE)));
+                    }
+                }
+            }
+        }
+        "pwd" => {
+            out.push(Some((String::from("/home/user"), colors::TEXT_WHITE)));
+        }
+        "whoami" => {
+            out.push(Some((String::from("root"), colors::TEXT_WHITE)));
+        }
+        "date" => {
+            let ticks = TICKS.load(Ordering::Relaxed);
+            let secs = ticks / 18;
+            out.push(Some((format!("1970-01-01 {:02}:{:02}:{:02} UTC (tick {})",
+                (secs / 3600) % 24, (secs / 60) % 60, secs % 60, ticks), colors::TEXT_WHITE)));
+        }
         _ => {
-            out.push(Some((format!("command not found: {}", parts[0]), colors::TEXT_RED)));
+            out.push(Some((format!("{}: command not found", parts[0]), colors::TEXT_RED)));
         }
     }
     out

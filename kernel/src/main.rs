@@ -8,9 +8,12 @@ mod ai;
 mod arch;
 mod cap;
 mod drivers;
+mod fs;
 mod gui;
 mod ipc;
+mod loader;
 mod mm;
+mod net;
 mod panic;
 mod proc;
 mod security;
@@ -65,7 +68,22 @@ fn kernel_main() -> ! {
     serial_println!("[drivers] Initializing framebuffer console...");
     drivers::framebuffer::init();
 
-    // --- Phase 6: Security hardening ---
+    // --- Filesystem ---
+    serial_println!();
+    serial_println!("[fs] Initializing VFS...");
+    fs::vfs::VFS.lock().init();
+    fs::devfs::init();
+    let (files, dirs, bytes) = fs::vfs::VFS.lock().stats();
+    serial_println!("[fs] VFS ready: {} files, {} dirs, {} bytes", files, dirs, bytes);
+
+    // --- Network ---
+    serial_println!();
+    serial_println!("[net] Detecting network interfaces...");
+    net::interface::detect();
+    let ifaces = net::interface::INTERFACES.lock().len();
+    serial_println!("[net] {} network interface(s) detected", ifaces);
+
+    // --- Security ---
     serial_println!();
     security::init();
 
