@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "kernel",
+    "lib/opsys-api",
+    "lib/opsys-rt",
+]
+
+[workspace.dependencies]
+opsys-api = { path = "lib/opsys-api" }
+opsys-rt  = { path = "lib/opsys-rt" }
+spin      = "0.9"
+bitflags  = "2"
+log       = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
