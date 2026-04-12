@@ -641,48 +641,115 @@ impl Desktop {
     pub fn handle_release(&mut self) { self.dragging = None; }
 
     /// Handle a keyboard character. Routes to the active terminal window.
-    pub fn handle_key(&mut self, ch: u8) {
-        // Find the active terminal window
+    /// Returns true if a full redraw is needed (Enter pressed), false for typing-only.
+    pub fn handle_key(&mut self, ch: u8) -> bool {
         let active_term_id = self.windows.iter()
             .find(|w| w.active && w.visible && w.is_terminal)
             .map(|w| w.id);
 
-        let Some(term_id) = active_term_id else { return; };
-        self.needs_full_redraw = true;
+        let Some(term_id) = active_term_id else { return false; };
 
         let term = self.windows.iter_mut().find(|w| w.id == term_id).unwrap();
 
         match ch {
             b'\n' => {
-                // Execute the command
                 let cmd = term.input_buf.clone();
                 term.add_styled(&format!("$ {}", cmd), colors::TEXT_GREEN);
                 term.input_buf.clear();
-                // Execute and collect output
                 let output = execute_terminal_cmd(&cmd);
                 for line in output {
                     match line {
                         Some((text, color)) => term.add_styled(&text, color),
-                        None => { term.lines.clear(); } // clear command
+                        None => { term.lines.clear(); }
                     }
                 }
+                self.needs_full_redraw = true;
+                return true; // Full redraw needed
             }
-            0x08 => {
-                // Backspace
-                term.input_buf.pop();
-            }
+            0x08 => { term.input_buf.pop(); }
             0x03 => {
-                // Ctrl+C
                 term.input_buf.clear();
                 term.add_line("^C");
+                self.needs_full_redraw = true;
+                return true;
             }
-            0x1B => {} // Escape - ignore
+            0x1B => {}
             ch if ch >= 0x20 && ch <= 0x7E => {
                 if term.input_buf.len() < 60 {
                     term.input_buf.push(ch as char);
                 }
             }
             _ => {}
+        }
+        false // Typing only — fast path
+    }
+
+    /// Fast update of just the terminal input line on the front buffer.
+    /// Avoids a full 4MB redraw for each keystroke.
+    pub fn update_terminal_input(&self) {
+        let term = match self.windows.iter().find(|w| w.active && w.visible && w.is_terminal) {
+            Some(w) => w,
+            None => return,
+        };
+
+        let input_y = term.y + term.height - 22;
+        let x = term.x + 1;
+        let w = term.width - 2;
+
+        // Clear input area directly on front buffer
+        let fb = self.painter.front_ptr();
+        let pitch = self.painter.pitch_bytes();
+        let bg = 0x00161616u32;
+        for dy in 0..18i32 {
+            let row = input_y + dy;
+            if row < 0 || row >= self.screen_h { continue; }
+            let row_ptr = unsafe { fb.add((row as u32 * pitch / 4) as usize) };
+            for dx in 0..w {
+                let col = x + dx;
+                if col >= 0 && col < self.screen_w {
+                    unsafe { row_ptr.add(col as usize).write_volatile(bg); }
+                }
+            }
+        }
+
+        // Draw prompt + input text
+        let prompt = alloc::format!("$ {}", term.input_buf);
+        let tx = term.x + 10;
+        let ty = input_y + 1;
+        for (i, byte) in prompt.bytes().enumerate() {
+            let cx = tx + i as i32 * 8;
+            if cx + 8 > term.x + term.width { break; }
+            let glyph = crate::drivers::framebuffer::font::get_glyph(byte);
+            for (dy, &row) in glyph.iter().enumerate() {
+                let py = ty + dy as i32;
+                if py < 0 || py >= self.screen_h { continue; }
+                let row_ptr = unsafe { fb.add((py as u32 * pitch / 4) as usize) };
+                for dx in 0..8i32 {
+                    if row & (0x80 >> dx) != 0 {
+                        let px = cx + dx;
+                        if px >= 0 && px < self.screen_w {
+                            unsafe { row_ptr.add(px as usize).write_volatile(colors::TEXT_GREEN); }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Blinking cursor
+        let cursor_x = tx + prompt.len() as i32 * 8;
+        let ticks = TICKS.load(Ordering::Relaxed);
+        if ticks % 18 < 9 {
+            for dy in 0..14i32 {
+                let py = ty + dy;
+                if py < 0 || py >= self.screen_h { continue; }
+                let row_ptr = unsafe { fb.add((py as u32 * pitch / 4) as usize) };
+                for dx in 0..8i32 {
+                    let px = cursor_x + dx;
+                    if px >= 0 && px < self.screen_w {
+                        unsafe { row_ptr.add(px as usize).write_volatile(colors::TEXT_GREEN); }
+                    }
+                }
+            }
         }
     }
 

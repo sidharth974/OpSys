@@ -193,6 +193,8 @@ impl Painter {
         }
     }
 
+    pub fn front_ptr(&self) -> *mut u32 { self.front as *mut u32 }
+    pub fn pitch_bytes(&self) -> u32 { self.pitch }
     pub fn screen_width(&self) -> i32 { self.width as i32 }
     pub fn screen_height(&self) -> i32 { self.height as i32 }
 }

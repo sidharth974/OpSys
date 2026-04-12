@@ -458,16 +458,20 @@ fn desktop_entry() {
 
     let mut prev_buttons = 0u8;
 
-    // GUI main loop
+    // GUI main loop: check input, draw if needed, sleep if idle
     loop {
         let mut did_something = false;
 
-        // Check mouse
+        // Check mouse (disable interrupts to avoid deadlock with mouse IRQ)
         let (mx, my, buttons, mouse_dirty) = {
+            x86_64::instructions::interrupts::disable();
             let mut m = gui::mouse::MOUSE.lock();
             let d = m.dirty;
             m.dirty = false;
-            (m.x, m.y, m.buttons, d)
+            let r = (m.x, m.y, m.buttons, d);
+            drop(m);
+            x86_64::instructions::interrupts::enable();
+            r
         };
 
         if mouse_dirty {
@@ -480,25 +484,43 @@ fn desktop_entry() {
             did_something = true;
         }
 
-        // Check keyboard
-        loop {
-            let key = gui::keyboard::KEYBOARD.lock().pop();
-            match key {
-                Some(ch) => {
-                    desktop.handle_key(ch);
-                    did_something = true;
+        // Drain all pending keyboard input.
+        // CRITICAL: disable interrupts while holding the keyboard lock
+        // to prevent deadlock with the keyboard IRQ handler.
+        let mut need_full = false;
+        let mut had_keys = false;
+        {
+            x86_64::instructions::interrupts::disable();
+            let mut kbd = gui::keyboard::KEYBOARD.lock();
+            let mut keys = alloc::vec::Vec::new();
+            while let Some(ch) = kbd.pop() {
+                keys.push(ch);
+            }
+            drop(kbd);
+            x86_64::instructions::interrupts::enable();
+
+            for ch in keys {
+                if desktop.handle_key(ch) {
+                    need_full = true;
                 }
-                None => break,
+                had_keys = true;
+                did_something = true;
             }
         }
 
-        // Redraw if anything changed
-        if did_something {
+        if need_full || (did_something && !had_keys) {
+            // Full redraw: Enter pressed, mouse clicked, etc.
             desktop.draw();
+            continue;
+        } else if had_keys {
+            // Fast path: just update the terminal input line directly on framebuffer
+            desktop.update_terminal_input();
+            continue;
         }
 
+        // Nothing happened — sleep until next interrupt, then yield
         x86_64::instructions::hlt();
-        yield_now();
+        // After waking from interrupt, loop back to check input
     }
 }
 
