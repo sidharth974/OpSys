@@ -72,6 +72,12 @@ fn pci_config_read(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
     }
 }
 
+/// Read a byte from PCI config space.
+pub fn pci_config_read_byte(bus: u8, dev: u8, func: u8, offset: u8) -> u8 {
+    let val = pci_config_read(bus, dev, func, offset & 0xFC);
+    ((val >> ((offset & 3) * 8)) & 0xFF) as u8
+}
+
 /// Read vendor and device ID.
 fn read_vendor_device(bus: u8, dev: u8, func: u8) -> (u16, u16) {
     let val = pci_config_read(bus, dev, func, 0x00);

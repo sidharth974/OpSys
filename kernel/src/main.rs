@@ -76,6 +76,11 @@ fn kernel_main() -> ! {
     let (files, dirs, bytes) = fs::vfs::VFS.lock().stats();
     serial_println!("[fs] VFS ready: {} files, {} dirs, {} bytes", files, dirs, bytes);
 
+    // --- Virtio ---
+    serial_println!();
+    serial_println!("[virtio] Detecting virtio devices...");
+    drivers::virtio::detect();
+
     // --- Network ---
     serial_println!();
     serial_println!("[net] Detecting network interfaces...");
@@ -484,28 +489,15 @@ fn desktop_entry() {
             did_something = true;
         }
 
-        // Drain all pending keyboard input.
-        // CRITICAL: disable interrupts while holding the keyboard lock
-        // to prevent deadlock with the keyboard IRQ handler.
+        // Drain keyboard (lock-free — no deadlock possible)
         let mut need_full = false;
         let mut had_keys = false;
-        {
-            x86_64::instructions::interrupts::disable();
-            let mut kbd = gui::keyboard::KEYBOARD.lock();
-            let mut keys = alloc::vec::Vec::new();
-            while let Some(ch) = kbd.pop() {
-                keys.push(ch);
+        while let Some(ch) = gui::keyboard::pop() {
+            if desktop.handle_key(ch) {
+                need_full = true;
             }
-            drop(kbd);
-            x86_64::instructions::interrupts::enable();
-
-            for ch in keys {
-                if desktop.handle_key(ch) {
-                    need_full = true;
-                }
-                had_keys = true;
-                did_something = true;
-            }
+            had_keys = true;
+            did_something = true;
         }
 
         if need_full || (did_something && !had_keys) {

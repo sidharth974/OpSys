@@ -1,84 +1,73 @@
-use spin::Mutex;
+use core::sync::atomic::{AtomicUsize, AtomicU8, AtomicBool, Ordering};
 
-/// Global keyboard state.
-pub static KEYBOARD: Mutex<KeyboardState> = Mutex::new(KeyboardState::new());
+/// Lock-free keyboard ring buffer.
+/// The IRQ handler writes, the desktop thread reads. No mutex needed.
+const BUF_SIZE: usize = 128;
 
-pub struct KeyboardState {
-    /// Ring buffer of key events.
-    pub buffer: [u8; 64],
-    pub head: usize,
-    pub tail: usize,
-    pub shift: bool,
-    pub ctrl: bool,
-    pub alt: bool,
-}
+static BUF: [AtomicU8; BUF_SIZE] = {
+    const INIT: AtomicU8 = AtomicU8::new(0);
+    [INIT; BUF_SIZE]
+};
+static HEAD: AtomicUsize = AtomicUsize::new(0); // IRQ writes here
+static TAIL: AtomicUsize = AtomicUsize::new(0); // Desktop reads here
+static SHIFT: AtomicBool = AtomicBool::new(false);
+static CTRL: AtomicBool = AtomicBool::new(false);
 
-impl KeyboardState {
-    const fn new() -> Self {
-        Self {
-            buffer: [0; 64],
-            head: 0, tail: 0,
-            shift: false, ctrl: false, alt: false,
-        }
-    }
-
-    /// Push an ASCII character into the buffer.
-    pub fn push(&mut self, ch: u8) {
-        let next = (self.head + 1) % self.buffer.len();
-        if next != self.tail {
-            self.buffer[self.head] = ch;
-            self.head = next;
-        }
-    }
-
-    /// Pop a character from the buffer. Returns None if empty.
-    pub fn pop(&mut self) -> Option<u8> {
-        if self.head == self.tail {
-            return None;
-        }
-        let ch = self.buffer[self.tail];
-        self.tail = (self.tail + 1) % self.buffer.len();
-        Some(ch)
-    }
-
-    /// Process a PS/2 scancode (set 1) and push the ASCII equivalent.
-    pub fn process_scancode(&mut self, scancode: u8) {
-        let pressed = scancode & 0x80 == 0;
-        let code = scancode & 0x7F;
-
-        match code {
-            0x2A | 0x36 => { self.shift = pressed; return; }  // Shift
-            0x1D => { self.ctrl = pressed; return; }           // Ctrl
-            0x38 => { self.alt = pressed; return; }            // Alt
-            _ => {}
-        }
-
-        if !pressed { return; }
-
-        let ch = if self.shift {
-            SCANCODE_SHIFT[code as usize]
-        } else {
-            SCANCODE_NORMAL[code as usize]
-        };
-
-        if ch == 0 { return; }
-
-        // Ctrl+C
-        if self.ctrl && ch == b'c' {
-            self.push(0x03);
-            return;
-        }
-
-        self.push(ch);
+/// Push a character into the buffer (called from IRQ context).
+fn push(ch: u8) {
+    let head = HEAD.load(Ordering::Relaxed);
+    let next = (head + 1) % BUF_SIZE;
+    if next != TAIL.load(Ordering::Relaxed) {
+        BUF[head].store(ch, Ordering::Relaxed);
+        HEAD.store(next, Ordering::Release);
     }
 }
 
-/// Called from the keyboard IRQ handler.
+/// Pop a character from the buffer (called from desktop thread).
+pub fn pop() -> Option<u8> {
+    let tail = TAIL.load(Ordering::Relaxed);
+    let head = HEAD.load(Ordering::Acquire);
+    if tail == head {
+        return None;
+    }
+    let ch = BUF[tail].load(Ordering::Relaxed);
+    TAIL.store((tail + 1) % BUF_SIZE, Ordering::Release);
+    Some(ch)
+}
+
+/// Called from the keyboard IRQ handler. No locks taken.
 pub fn handle_interrupt(scancode: u8) {
-    KEYBOARD.lock().process_scancode(scancode);
+    let pressed = scancode & 0x80 == 0;
+    let code = scancode & 0x7F;
+
+    match code {
+        0x2A | 0x36 => { SHIFT.store(pressed, Ordering::Relaxed); return; }
+        0x1D => { CTRL.store(pressed, Ordering::Relaxed); return; }
+        0x38 => { return; } // Alt
+        _ => {}
+    }
+
+    if !pressed { return; }
+
+    let shift = SHIFT.load(Ordering::Relaxed);
+    let ctrl = CTRL.load(Ordering::Relaxed);
+
+    let ch = if shift {
+        SCANCODE_SHIFT[code as usize]
+    } else {
+        SCANCODE_NORMAL[code as usize]
+    };
+
+    if ch == 0 { return; }
+
+    if ctrl && (ch == b'c' || ch == b'C') {
+        push(0x03); // Ctrl+C
+        return;
+    }
+
+    push(ch);
 }
 
-/// PS/2 scancode set 1 -> ASCII (normal).
 static SCANCODE_NORMAL: [u8; 128] = {
     let mut t = [0u8; 128];
     t[0x01] = 0x1B; // Escape
@@ -90,7 +79,7 @@ static SCANCODE_NORMAL: [u8; 128] = {
     t[0x10] = b'q'; t[0x11] = b'w'; t[0x12] = b'e'; t[0x13] = b'r';
     t[0x14] = b't'; t[0x15] = b'y'; t[0x16] = b'u'; t[0x17] = b'i';
     t[0x18] = b'o'; t[0x19] = b'p'; t[0x1A] = b'['; t[0x1B] = b']';
-    t[0x1C] = b'\n'; // Enter
+    t[0x1C] = b'\n';
     t[0x1E] = b'a'; t[0x1F] = b's'; t[0x20] = b'd'; t[0x21] = b'f';
     t[0x22] = b'g'; t[0x23] = b'h'; t[0x24] = b'j'; t[0x25] = b'k';
     t[0x26] = b'l'; t[0x27] = b';'; t[0x28] = b'\'';
@@ -99,11 +88,10 @@ static SCANCODE_NORMAL: [u8; 128] = {
     t[0x2C] = b'z'; t[0x2D] = b'x'; t[0x2E] = b'c'; t[0x2F] = b'v';
     t[0x30] = b'b'; t[0x31] = b'n'; t[0x32] = b'm';
     t[0x33] = b','; t[0x34] = b'.'; t[0x35] = b'/';
-    t[0x39] = b' '; // Space
+    t[0x39] = b' ';
     t
 };
 
-/// PS/2 scancode set 1 -> ASCII (shift held).
 static SCANCODE_SHIFT: [u8; 128] = {
     let mut t = [0u8; 128];
     t[0x01] = 0x1B;

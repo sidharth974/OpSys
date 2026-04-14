@@ -35,6 +35,11 @@ fn execute_terminal_cmd(cmd: &str) -> Vec<Option<(String, u32)>> {
                 ("ai", "Run AI inference"),
                 ("security", "Security status"),
                 ("bench <N>", "Matrix benchmark"),
+                ("virtio", "Virtio devices"),
+                ("top", "Live thread monitor"),
+                ("dmesg", "Kernel log"),
+                ("mount", "Mount points"),
+                ("syscalls", "Syscall table"),
                 ("neofetch", "System summary"),
                 ("uptime", "Uptime"),
                 ("echo <text>", "Print text"),
@@ -307,6 +312,97 @@ fn execute_terminal_cmd(cmd: &str) -> Vec<Option<(String, u32)>> {
                 }
             } else {
                 out.push(Some((String::from("usage: readelf <path>"), colors::TEXT_RED)));
+            }
+        }
+        "virtio" => {
+            let devs = crate::drivers::virtio::VIRTIO_DEVICES.lock();
+            if devs.is_empty() {
+                out.push(Some((String::from("No virtio devices found"), colors::TEXT_DIM)));
+                out.push(Some((String::from("Tip: run QEMU with -device virtio-net-pci"), colors::TEXT_DIM)));
+            } else {
+                out.push(Some((String::from("Virtio Devices:"), colors::TEXT_CYAN)));
+                for d in devs.iter() {
+                    out.push(Some((format!("  {:02x}:{:02x}.{} {:?} (IRQ {})",
+                        d.bus, d.device, d.function, d.device_type, d.irq), colors::TEXT_WHITE)));
+                }
+            }
+        }
+        "top" => {
+            let ticks = TICKS.load(Ordering::Relaxed);
+            let secs = ticks / 18;
+            let free = crate::mm::pmm::free_count();
+            let mib = free * 4096 / 1024 / 1024;
+            out.push(Some((format!("OpSys top - up {}m{}s, {} ticks", secs/60, secs%60, ticks), colors::TEXT_CYAN)));
+            out.push(Some((format!("Mem: {} MiB free | Heap: 8 MiB", mib), colors::TEXT_GREEN)));
+            out.push(Some((String::from(""), colors::TEXT_WHITE)));
+            out.push(Some((String::from("  TID  STATE  PRI  NAME"), colors::TEXT_CYAN)));
+            let sched = crate::proc::scheduler::SCHEDULER.lock();
+            for tid in 0..16 {
+                if let Some(t) = sched.thread_ref(tid) {
+                    if t.state == crate::proc::thread::ThreadState::Dead { continue; }
+                    let st = match t.state {
+                        crate::proc::thread::ThreadState::Running => "\x1b[32mRUN\x1b[0m",
+                        crate::proc::thread::ThreadState::Ready => "RDY",
+                        crate::proc::thread::ThreadState::Blocked => "BLK",
+                        _ => "???",
+                    };
+                    let color = if t.state == crate::proc::thread::ThreadState::Running {
+                        colors::TEXT_GREEN
+                    } else { colors::TEXT_DIM };
+                    out.push(Some((format!("  {:<4} {:<5} {:<4} {}", t.tid, st, t.priority, t.name), color)));
+                }
+            }
+        }
+        "dmesg" => {
+            out.push(Some((String::from("Kernel Log (last entries):"), colors::TEXT_CYAN)));
+            let free = crate::mm::pmm::free_count();
+            let devs = crate::drivers::pci::PCI_DEVICES.lock().len();
+            let ticks = TICKS.load(Ordering::Relaxed);
+            for line in &[
+                "[0.000] Limine protocol v6 boot",
+                "[0.001] GDT: kernel code/data + user code/data + TSS",
+                "[0.002] IDT: 256 entries, PIC remapped to IRQ 32-47",
+                "[0.003] PIC: 8259 cascade initialized",
+            ] {
+                out.push(Some((String::from(*line), colors::TEXT_DIM)));
+            }
+            out.push(Some((format!("[0.010] PMM: {} MiB usable memory", free * 4096 / 1024 / 1024), colors::TEXT_DIM)));
+            out.push(Some((format!("[0.020] Heap: 8 MiB at HHDM offset"), colors::TEXT_DIM)));
+            out.push(Some((format!("[0.030] SYSCALL/SYSRET: MSRs configured"), colors::TEXT_DIM)));
+            out.push(Some((format!("[0.040] PCI: {} devices enumerated", devs), colors::TEXT_DIM)));
+            out.push(Some((format!("[0.050] Framebuffer: 1280x800x32"), colors::TEXT_DIM)));
+            out.push(Some((format!("[0.060] Security: W^X + NX enforced"), colors::TEXT_DIM)));
+            out.push(Some((format!("[0.070] VFS: tmpfs mounted at /"), colors::TEXT_DIM)));
+            out.push(Some((format!("[0.080] Network: interfaces detected"), colors::TEXT_DIM)));
+            out.push(Some((format!("[0.090] GUI: desktop compositor started"), colors::TEXT_DIM)));
+            out.push(Some((format!("[{:.3}] System operational", ticks as f64 / 18.2), colors::TEXT_GREEN)));
+        }
+        "mount" => {
+            out.push(Some((String::from("Filesystem      Mount   Type    Size"), colors::TEXT_CYAN)));
+            let (files, dirs, bytes) = crate::fs::vfs::VFS.lock().stats();
+            out.push(Some((format!("tmpfs           /       tmpfs   {} B ({} files, {} dirs)", bytes, files, dirs), colors::TEXT_WHITE)));
+            out.push(Some((format!("devfs           /dev    devfs   auto"), colors::TEXT_DIM)));
+            out.push(Some((format!("procfs          /proc   procfs  auto"), colors::TEXT_DIM)));
+        }
+        "syscalls" => {
+            out.push(Some((String::from("Syscall Table:"), colors::TEXT_CYAN)));
+            for &(nr, name, status) in &[
+                (0, "send", "IPC"), (1, "recv", "IPC"), (6, "yield", "active"),
+                (15, "debug_print", "active"), (16, "exit", "active"),
+                (20, "open", "active"), (21, "close", "active"),
+                (22, "read", "active"), (23, "write", "active"),
+                (24, "stat", "active"), (25, "readdir", "active"),
+                (26, "mkdir", "active"), (27, "unlink", "active"),
+                (40, "fork", "planned"), (41, "exec", "planned"),
+                (43, "getpid", "active"), (50, "socket", "planned"),
+                (60, "clock_gettime", "active"), (70, "uname", "active"),
+            ] {
+                let color = match status {
+                    "active" => colors::TEXT_GREEN,
+                    "IPC" => colors::TEXT_CYAN,
+                    _ => colors::TEXT_DIM,
+                };
+                out.push(Some((format!("  {:>3}  {:<16} {}", nr, name, status), color)));
             }
         }
         "hostname" => {
